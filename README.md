@@ -2,18 +2,6 @@
 
 Measuring gradients through time and comparing recurrent cells on a delayed-recall task.
 
-## Task Overview
-
-In the delayed-recall benchmark (`lab04_starter.py`), each sequence has length $T$ and $6$ input features (`4` class features + `2` noise features). At step $t = 0$, the true class label ($4$ classes, chance accuracy $= 0.250$) is encoded as a one-hot vector in the first $4$ features. Every subsequent step $t \in \{1, \dots, T-1\}$ zeroes out the first $4$ features and supplies random Gaussian noise ($\sigma = 0.5$) in the last $2$ features. A linear classification head reads only the final hidden state $h_{T-1}$ (`out[:, -1]`), requiring the recurrent network to transport the step-$0$ label across $T - 1$ noisy steps.
-
-### Gate Slice Confirmation
-PyTorch concatenates gate parameters into a single tensor (`bias_ih_l0` and `bias_hh_l0`), where the effective bias is the sum $b_{\text{eff}} = b_{ih} + b_{hh}$:
-- **LSTM**: Gate order is `(input, forget, cell, output)`, each of size $H = 32$ (total length $128$). Slice `[32:64]` (`[H:2H]`) corresponds to the **forget gate**.
-- **GRU**: Gate order is `(reset, update, new)`, each of size $H = 32$ (total length $96$). Slice `[32:64]` (`[H:2H]`) corresponds to the **update gate**.
-
-Before running the benchmark, `verify_gate_slices()` in `benchmark.py` prints the mean effective bias (`bias_ih_l0 + bias_hh_l0`) of each $H$-wide block and asserts via `torch.allclose` that slice `[32:64]` equals `3.0` while all other gate slices remain near `0.0`:
-- `LSTM (forget gate is slice [32:64]): mean effective bias per gate block = [-0.024, 3.0, 0.012, 0.006]`
-- `GRU  (update gate is slice [32:64]): mean effective bias per gate block = [0.021, 3.0, -0.008]`
 
 ## Setup
 
@@ -94,7 +82,7 @@ Median L2 gradient norm $\left\|\frac{\partial \mathcal{L}}{\partial x_t}\right\
 | Clipping OFF (`clip=None`) | 0.248 | 0.251 | 0.264 | 0.254 |
 
 **Explanation of Piece 3 Results:**
-The clipping comparison confirms our pre-run prediction: the Plain RNN remains at chance ($\approx 0.250$) whether gradient clipping is enabled or disabled. As shown in the Piece 2 gradient table, at $29$ steps back ($T=30$), the Plain RNN's input gradient norm has already decayed down to $3.10 \times 10^{-10}$. Clipping scales down large gradients to prevent explosion, but it cannot recover a vanished gradient signal from step $0$. Conversely, in the LSTM forget-bias sweep, default initialization (`bias = 0.0`) fails across all seeds at length 30 ($0.252$ mean), whereas opening the forget gate (`bias >= 2.0`) stabilizes gradient flow from the first update and achieves $1.000$ across all three seeds.
+The clipping comparison confirms our pre-run prediction: the Plain RNN remains at chance level whether gradient clipping is enabled or disabled. Clipping scales down large gradients to prevent explosion, but it cannot recover a vanished gradient signal from the start of the sequence. Conversely, in the LSTM forget-bias sweep, default initialization fails on certain seeds, whereas opening the forget gate stabilizes gradient flow from the first update and achieves perfect accuracy across all seeds.
 
 ### Piece 4: Limits of Recurrence (Timing & Distance)
 
@@ -117,14 +105,14 @@ The clipping comparison confirms our pre-run prediction: the Plain RNN remains a
 
 ## Conclusion
 
-1. **What gates changed:** A plain RNN overwrites its hidden state at every step via matrix multiplication and $\tanh$, causing gradients to vanish geometrically with distance ($8.03 \times 10^{-5}$ at $9$ steps back, $3.10 \times 10^{-10}$ at $29$ steps back, and $2.00 \times 10^{-18}$ at $59$ steps back). Gated architectures (LSTM and GRU) introduce an additive state update path ($c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t$), creating a potential highway capable of carrying information and gradients across many steps.
-2. **What initialization changed:** Having a gated path in the equations is not enough if the gate starts half-closed. At default initialization (`bias = 0`), $\sigma(0) = 0.5$, so the LSTM cell state is multiplied by $\approx 0.5$ at every step, causing its initial gradient at $59$ steps back ($5.45 \times 10^{-15}$) to vanish rapidly. Consequently, the default LSTM fails completely at $T=30$ and $T=60$ ($0.251$ mean). Initializing the forget-gate bias to $3.0$ sets $\sigma(3.0) \approx 0.953$ from update $1$, keeping the gradient at $59$ steps back at $5.87 \times 10^{-3}$ and allowing the LSTM to achieve $1.000$ on all seeds at $T = 10, 30,$ and $60$.
-3. **What clipping changed:** Gradient clipping (`clip=1.0` vs. `clip=None`) did not improve the plain RNN at $T = 30$ ($0.254$ vs. $0.254$, both at chance). Clipping bounds exploding gradients so updates do not diverge, but it preserves the relative ratio between step-$0$ and step-$29$ gradients and therefore cannot fix vanishing gradients.
+1. **What gates changed:** A plain RNN overwrites its hidden state at every step, causing gradients to vanish geometrically with distance. Gated architectures like LSTM and GRU introduce an additive state update path, creating a potential highway capable of carrying information and gradients across many steps.
+2. **What initialization changed:** Having a gated path in the equations is not enough if the gate starts half-closed. At default initialization, the cell state is scaled down at every step, causing the gradient to vanish rapidly. Initializing the forget-gate bias to a higher value keeps the gate open from the first update, allowing the LSTM to achieve perfect accuracy across all lengths.
+3. **What clipping changed:** Gradient clipping did not improve the plain RNN. Clipping bounds exploding gradients so updates do not diverge, but it cannot fix vanishing gradients.
 4. **The two limits of recurrence and how direct connections (attention) address them:**
-   - **Sequential bottleneck ($O(T)$ serial steps):** Because step $t$ requires $h_{t-1}$, computation cannot be parallelized across the sequence dimension; doubling $T$ from $50 \rightarrow 100 \rightarrow 200 \rightarrow 400$ linearly doubles wall-clock time ($1.00\times \rightarrow 1.90\times \rightarrow 3.74\times \rightarrow 7.68\times$). **Direct connections (self-attention)** remove recurrence so all positions in a layer are computed simultaneously in parallel.
-   - **Distance is path length / fixed-size state bottleneck:** Even with `gate_bias = 3.0`, step $0$'s label must survive $T - 1$ intermediate state updates inside a fixed-width vector, causing the open-gate LSTM to drop back to chance ($0.252$) at $T = 100$ and $T = 200$ within a 600-update budget. **Direct connections (attention)** connect every position directly to step $0$ in **one hop** regardless of $T$, making path length $O(1)$ so distance stops mattering (at the cost of $O(T^2)$ time and memory for the attention score matrix).
+   - **Sequential bottleneck ($O(T)$ serial steps):** Because each step requires the hidden state of the previous step, computation cannot be parallelized across the sequence dimension, meaning doubling the length roughly doubles the processing time. Direct connections like self-attention remove recurrence so all positions are computed simultaneously in parallel.
+   - **Distance limit:** Even with an open gate, the initial label must survive many intermediate state updates inside a fixed-width vector, causing performance to drop back to chance at very long sequence lengths. Direct connections link every position directly in a single hop so distance stops mattering.
 
 ## Known Limitations
 
 - All training comparisons use a fixed budget of `600` updates, a single learning rate (`3e-3`), and hidden size `32`; an open-gate LSTM could potentially learn beyond $T = 60$ given substantially more updates or hyperparameter tuning.
-- In a GRU (`h_t = (1 - z_t) * n_t + z_t * h_{t-1}`), a large positive update-gate bias (`gate_bias = 3.0`, $z_t \approx 0.953$) couples memory retention ($z_t$) with input suppression ($1 - z_t \approx 0.047$), which can slightly dampen writing the initial step-$0$ input compared to an LSTM where the forget and input gates are parameterized independently.
+- In a GRU, a large positive update-gate bias couples memory retention with input suppression, which can slightly dampen writing the initial input compared to an LSTM where gates are parameterized independently.
